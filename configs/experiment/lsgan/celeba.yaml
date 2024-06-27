@@ -1,0 +1,13 @@
+# @package _global_
+defaults:
+  - override /model: gan
+  - override /networks: conv_64
+  - override /datamodule: celeba
+
+exp_name: lsgan/celeba
+model:
+  loss_mode: lsgan
+  lrG: 2e-4
+  lrD: 2e-4
+trainer:
+  max_epochs: 100
