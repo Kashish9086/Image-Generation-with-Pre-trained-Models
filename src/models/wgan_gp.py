@@ -1,0 +1,114 @@
+from pathlib import Path
+
+import hydra
+import pytorch_lightning as pl
+import torch
+import torch.nn.functional as F
+import torchvision
+from src.utils import utils
+from .base import BaseModel, ValidationResult
+
+
+class WGAN(BaseModel):
+    def __init__(
+        self,
+        datamodule,
+        netG,
+        netD,
+        latent_dim=100,
+        n_critic=5,
+        lrG: float = 1e-4,
+        lrD: float = 1e-4,
+        b1: float = 0,
+        b2: float = 0.9,
+        gp_weight=10,
+    ):
+        super().__init__(datamodule)
+        self.save_hyperparameters()
+        self.automatic_optimization = False
+
+        self.generator = hydra.utils.instantiate(netG, input_channel=latent_dim, output_channel=self.channels, norm_type="layer")
+        self.discriminator = hydra.utils.instantiate(netD, input_channel=self.channels, output_channel=1, norm_type="layer")
+
+    def forward(self, z):
+        output = self.generator(z)
+        output = output.reshape(
+            z.shape[0], self.channels, self.height, self.width
+        )
+        return output
+
+    def configure_optimizers(self):
+        lrG = self.hparams.lrG
+        lrD = self.hparams.lrD
+        b1 = self.hparams.b1
+        b2 = self.hparams.b2
+
+        opt_g = torch.optim.Adam(
+            self.generator.parameters(), lr=lrG, betas=(b1, b2)
+        )
+        opt_d = torch.optim.Adam(
+            self.discriminator.parameters(), lr=lrD, betas=(b1, b2)
+        )
+        return opt_g, opt_d
+
+    def training_step(self, batch, batch_idx):
+        imgs, _ = batch  # (N, C, H, W)
+
+        # sample noise
+        z = torch.randn(imgs.shape[0], self.hparams.latent_dim)  # (N, latent_dim)
+        z = z.type_as(imgs)
+
+        opt_g, opt_d = self.optimizers()
+
+        if batch_idx % (self.hparams.n_critic+1) == self.hparams.n_critic:
+            generated_imgs = self(z)
+
+            g_loss = -torch.mean(self.discriminator(generated_imgs))
+            self.log("train_loss/g_loss", g_loss, prog_bar=True)
+
+            opt_g.zero_grad()
+            self.manual_backward(g_loss)
+            opt_g.step()
+
+        else:
+            # real loss
+            real_loss = -self.discriminator(imgs).mean()
+
+            # fake loss
+            fake_imgs = self(z)
+            fake_loss = self.discriminator(fake_imgs.detach()).mean()
+
+            # gradient panelty
+            N = imgs.shape[0]
+            lerp = torch.zeros(N, 1, 1, 1).uniform_().to(self.device)
+            inter_x = torch.tensor(
+                lerp * imgs + (1 - lerp) * fake_imgs, requires_grad=True
+            ).to(self.device)
+            prob_inter = self.discriminator(inter_x)
+            gradients = torch.autograd.grad(
+                outputs=prob_inter,
+                inputs=inter_x,
+                grad_outputs=torch.ones_like(prob_inter).to(self.device),
+                create_graph=True,
+                retain_graph=True,
+            )[0]
+            gradient_panelty = torch.mean(
+                (torch.linalg.vector_norm(gradients.reshape(N, -1), dim=1) - 1) ** 2
+            )
+
+            # discriminator loss is the average of these
+            d_loss = real_loss + fake_loss + self.hparams.gp_weight * gradient_panelty
+            self.log("train_loss/d_loss", d_loss)
+            self.log("train_log/real_logit", -real_loss)
+            self.log("train_log/fake_logit", fake_loss)
+            self.log("train_log/gradient_panelty", gradient_panelty)
+
+            opt_d.zero_grad()
+            self.manual_backward(d_loss)
+            opt_d.step()
+
+    def validation_step(self, batch, batch_idx):
+        img, _ = batch
+        z = torch.randn(img.shape[0], self.hparams.latent_dim).to(self.device)
+        fake_imgs = self.forward(z)
+        return ValidationResult(real_image=img, fake_image=fake_imgs)
